@@ -1,0 +1,17 @@
+data/
+outputs/
+*.svs
+*.tif
+*.tiff
+*.ndpi
+*.pt
+*.pth
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.parquet
+*.csv
+__pycache__/
+.DS_Store
+.env
