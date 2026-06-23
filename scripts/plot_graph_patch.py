@@ -77,6 +77,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="If set, draw edges faintly behind the cell scatter points.",
     )
+    parser.add_argument(
+        "--title",
+        required=False,
+        type=str,
+        default=None,
+        help="Optional plot title. Defaults to a generated title with the patch center and window.",
+    )
     return parser.parse_args()
 
 
@@ -170,7 +177,10 @@ def main() -> None:
     ax.set_xlabel("x_um")
     ax.set_ylabel("y_um")
     ax.set_aspect("equal")
-    ax.set_title(f"JAGO graph patch (center=({center_x_um:.1f}, {center_y_um:.1f}), window={args.window_um}um)")
+    title = args.title if args.title is not None else (
+        f"JAGO graph patch (center=({center_x_um:.1f}, {center_y_um:.1f}), window={args.window_um}um)"
+    )
+    ax.set_title(title)
     ax.legend(markerscale=2, fontsize="small", loc="best")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
