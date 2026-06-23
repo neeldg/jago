@@ -34,6 +34,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--out", required=True, type=Path, help="Path to write the output stats JSON."
     )
+    parser.add_argument(
+        "--type-map",
+        required=False,
+        type=Path,
+        default=None,
+        help=(
+            "Optional JSON file mapping type ids (e.g. 'type_1') to readable "
+            "names (e.g. 'neoplastic'). When given, readable names are used "
+            "for cell/edge type counts while the original type ids are "
+            "preserved under '_by_id' fields."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -53,27 +65,68 @@ def load_table(path: Path, required_columns: list) -> pd.DataFrame:
     return table
 
 
-def edge_type_key(type_a: str, type_b: str) -> str:
+def load_type_map(path: Path) -> dict:
+    if not path.exists():
+        raise FileNotFoundError(f"Type map not found: {path}")
+
+    with path.open() as f:
+        type_map = json.load(f)
+
+    if not isinstance(type_map, dict):
+        raise ValueError(f"Type map {path} must be a JSON object of type id -> readable name.")
+
+    return type_map
+
+
+def edge_type_key(type_a: str, type_b: str, type_map: dict = None) -> str:
+    if type_map:
+        type_a = type_map.get(type_a, type_a)
+        type_b = type_map.get(type_b, type_b)
     return "-".join(sorted([type_a, type_b]))
 
 
-def compute_stats(cells: pd.DataFrame, edges: pd.DataFrame) -> dict:
+def compute_stats(cells: pd.DataFrame, edges: pd.DataFrame, type_map: dict = None) -> dict:
     n_cells = len(cells)
     n_edges = len(edges)
     mean_degree = (2 * n_edges / n_cells) if n_cells > 0 else 0.0
 
-    cell_type_counts = cells["cell_type"].value_counts().to_dict()
-    cell_type_fractions = (
-        {k: v / n_cells for k, v in cell_type_counts.items()} if n_cells > 0 else {}
+    cell_type_counts_by_id = cells["cell_type"].value_counts().to_dict()
+    cell_type_fractions_by_id = (
+        {k: v / n_cells for k, v in cell_type_counts_by_id.items()} if n_cells > 0 else {}
     )
 
+    if type_map:
+        readable_cell_type = cells["cell_type"].map(lambda t: type_map.get(t, t))
+        cell_type_counts = readable_cell_type.value_counts().to_dict()
+        cell_type_fractions = (
+            {k: v / n_cells for k, v in cell_type_counts.items()} if n_cells > 0 else {}
+        )
+    else:
+        cell_type_counts = cell_type_counts_by_id
+        cell_type_fractions = cell_type_fractions_by_id
+
     if n_edges > 0:
-        edge_type_keys = edges.apply(
+        edge_type_keys_by_id = edges.apply(
             lambda row: edge_type_key(row["source_cell_type"], row["target_cell_type"]),
             axis=1,
         )
-        edge_type_counts = edge_type_keys.value_counts().to_dict()
-        edge_type_fractions = {k: v / n_edges for k, v in edge_type_counts.items()}
+        edge_type_counts_by_id = edge_type_keys_by_id.value_counts().to_dict()
+        edge_type_fractions_by_id = {
+            k: v / n_edges for k, v in edge_type_counts_by_id.items()
+        }
+
+        if type_map:
+            edge_type_keys = edges.apply(
+                lambda row: edge_type_key(
+                    row["source_cell_type"], row["target_cell_type"], type_map
+                ),
+                axis=1,
+            )
+            edge_type_counts = edge_type_keys.value_counts().to_dict()
+            edge_type_fractions = {k: v / n_edges for k, v in edge_type_counts.items()}
+        else:
+            edge_type_counts = edge_type_counts_by_id
+            edge_type_fractions = edge_type_fractions_by_id
 
         same_type_mask = edges["source_cell_type"] == edges["target_cell_type"]
         same_type_edge_fraction = same_type_mask.sum() / n_edges
@@ -85,12 +138,14 @@ def compute_stats(cells: pd.DataFrame, edges: pd.DataFrame) -> dict:
     else:
         edge_type_counts = {}
         edge_type_fractions = {}
+        edge_type_counts_by_id = {}
+        edge_type_fractions_by_id = {}
         same_type_edge_fraction = 0.0
         mixed_type_edge_fraction = 0.0
         mean_edge_distance_um = 0.0
         median_edge_distance_um = 0.0
 
-    return {
+    stats = {
         "n_cells": n_cells,
         "n_edges": n_edges,
         "mean_degree": mean_degree,
@@ -103,6 +158,15 @@ def compute_stats(cells: pd.DataFrame, edges: pd.DataFrame) -> dict:
         "mean_edge_distance_um": mean_edge_distance_um,
         "median_edge_distance_um": median_edge_distance_um,
     }
+
+    if type_map:
+        stats["type_map"] = type_map
+        stats["cell_type_counts_by_id"] = cell_type_counts_by_id
+        stats["cell_type_fractions_by_id"] = cell_type_fractions_by_id
+        stats["edge_type_counts_by_id"] = edge_type_counts_by_id
+        stats["edge_type_fractions_by_id"] = edge_type_fractions_by_id
+
+    return stats
 
 
 def print_summary(stats: dict, out_path: Path) -> None:
@@ -129,8 +193,9 @@ def main() -> None:
 
     cells = load_table(args.cells, REQUIRED_CELL_COLUMNS)
     edges = load_table(args.edges, REQUIRED_EDGE_COLUMNS)
+    type_map = load_type_map(args.type_map) if args.type_map else None
 
-    stats = compute_stats(cells, edges)
+    stats = compute_stats(cells, edges, type_map)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w") as f:
