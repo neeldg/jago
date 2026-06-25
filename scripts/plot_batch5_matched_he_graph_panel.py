@@ -109,7 +109,8 @@ ITEMS = [
     },
 ]
 
-TITLE_TEXT = "JAGO Batch 5: Matched H&E Crops and Cell Graphs"
+TITLE_TEXT = "JAGO batch5: matched H&E crops and cell graphs"
+SCALE_BAR_UM = 100.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -154,6 +155,29 @@ def load_patch_graph(patches_root: Path, slide_id: str, patch_id: str):
     return cells, edges
 
 
+def add_scale_bar(ax, bounds: tuple, scale_um: float = SCALE_BAR_UM) -> None:
+    x_min_um, x_max_um, y_min_um, y_max_um = bounds
+    width_um = x_max_um - x_min_um
+    height_um = y_max_um - y_min_um
+
+    margin_x_um = width_um * 0.06
+    margin_y_um = height_um * 0.08
+
+    x_end = x_max_um - margin_x_um
+    x_start = x_end - scale_um
+    y_bar = y_max_um - margin_y_um
+
+    # Data coordinates are microns, so a 100 um bar is just a 100-unit line.
+    ax.plot(
+        [x_start, x_end], [y_bar, y_bar],
+        color="black", linewidth=3, solid_capstyle="butt", zorder=4,
+    )
+    ax.text(
+        (x_start + x_end) / 2, y_bar - height_um * 0.02, f"{scale_um:g} µm",
+        color="black", fontsize=9, ha="center", va="bottom", zorder=4,
+    )
+
+
 def render_matched_graph(ax, cells: pd.DataFrame, edges: pd.DataFrame, bounds: tuple) -> None:
     x_min_um, x_max_um, y_min_um, y_max_um = bounds
 
@@ -177,8 +201,13 @@ def render_matched_graph(ax, cells: pd.DataFrame, edges: pd.DataFrame, bounds: t
     ax.set_ylim(y_max_um, y_min_um)
     ax.set_autoscale_on(False)
     ax.set_aspect("equal")
+
+    add_scale_bar(ax, bounds)
+
     ax.set_xticks([])
     ax.set_yticks([])
+    ax.set_xlabel("")
+    ax.set_ylabel("")
 
 
 def save_individual_graph(cells, edges, bounds, out_path: Path) -> None:
@@ -245,11 +274,15 @@ def main() -> None:
     n_rows = len(resolved_items)
     fig, axes = plt.subplots(n_rows, 2, figsize=(10, 5 * n_rows), facecolor="white")
 
-    fig.suptitle(TITLE_TEXT, fontsize=18, y=0.995)
+    # Reserve a generous top margin so the suptitle and column headers each
+    # get their own clear band of space and never overlap.
+    fig.subplots_adjust(top=0.93, bottom=0.06, hspace=0.35, wspace=0.15)
 
-    col_header_y = 1.0 - 0.012
-    fig.text(0.28, col_header_y, "H&E crop", ha="center", fontsize=14, fontweight="bold")
-    fig.text(0.78, col_header_y, "JAGO cell graph", ha="center", fontsize=14, fontweight="bold")
+    fig.suptitle(TITLE_TEXT, fontsize=20, y=0.985)
+
+    col_header_y = 0.945
+    fig.text(0.28, col_header_y, "H&E crop", ha="center", fontsize=15, fontweight="bold")
+    fig.text(0.74, col_header_y, "JAGO cell graph", ha="center", fontsize=15, fontweight="bold")
 
     for row_idx, entry in enumerate(resolved_items):
         he_ax = axes[row_idx, 0]
@@ -271,8 +304,6 @@ def main() -> None:
         bbox_to_anchor=(0.5, -0.01),
         fontsize=11,
     )
-
-    fig.tight_layout(rect=[0, 0.035, 1, 0.97])
 
     args.out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.out_png, dpi=300, bbox_inches="tight", facecolor="white")
