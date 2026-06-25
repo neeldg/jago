@@ -1,12 +1,10 @@
 """Plot JAGO cell graphs that share the exact field of view as their H&E crops.
 
-The previous representative-patch panel plotted each graph using the median
-cell coordinates and a default window size, so the rendered field of view
-did not line up with the corresponding H&E crop. This script instead reads
-each patch's exact x/y bounds from patch_manifest.csv and uses those same
-bounds (and equal aspect ratio, inverted y-axis, no autoscaling) for both the
-standalone graph PNG and the combined H&E/graph panel, so the two images
-correspond 1:1.
+Reads each patch's exact x/y bounds from patch_manifest.csv and uses those
+same bounds (equal aspect ratio, inverted y-axis, no autoscaling) for both
+the H&E crop and the cell graph, with both displayed on micron axes so the
+two panels are a true 1:1 physical-coordinate comparison rather than one
+being a plain pixel image and the other a coordinate plot.
 """
 
 import argparse
@@ -138,6 +136,34 @@ def load_manifest_row(patches_root: Path, slide_id: str, patch_id: str) -> pd.Se
     return matches.iloc[0]
 
 
+def get_patch_bounds(row: pd.Series) -> tuple:
+    direct_cols = ["x_min_um", "x_max_um", "y_min_um", "y_max_um"]
+    if all(col in row.index and pd.notna(row[col]) for col in direct_cols):
+        return (
+            float(row["x_min_um"]),
+            float(row["x_max_um"]),
+            float(row["y_min_um"]),
+            float(row["y_max_um"]),
+        )
+
+    center_cols = ["center_x_um", "center_y_um", "window_um"]
+    if all(col in row.index and pd.notna(row[col]) for col in center_cols):
+        center_x_um = float(row["center_x_um"])
+        center_y_um = float(row["center_y_um"])
+        half_window_um = float(row["window_um"]) / 2
+        return (
+            center_x_um - half_window_um,
+            center_x_um + half_window_um,
+            center_y_um - half_window_um,
+            center_y_um + half_window_um,
+        )
+
+    raise ValueError(
+        "Manifest row has neither x_min_um/x_max_um/y_min_um/y_max_um nor "
+        "center_x_um/center_y_um/window_um columns needed to compute patch bounds."
+    )
+
+
 def load_patch_graph(patches_root: Path, slide_id: str, patch_id: str):
     patch_dir = patches_root / slide_id
 
@@ -178,9 +204,23 @@ def add_scale_bar(ax, bounds: tuple, scale_um: float = SCALE_BAR_UM) -> None:
     )
 
 
-def render_matched_graph(ax, cells: pd.DataFrame, edges: pd.DataFrame, bounds: tuple) -> None:
+def style_micron_axes(ax, bounds: tuple) -> None:
     x_min_um, x_max_um, y_min_um, y_max_um = bounds
 
+    # Set limits explicitly and disable autoscale so the field of view
+    # exactly matches the manifest bounds, not the data/image extent.
+    ax.set_xlim(x_min_um, x_max_um)
+    ax.set_ylim(y_max_um, y_min_um)
+    ax.set_autoscale_on(False)
+    ax.set_aspect("equal")
+    ax.set_xlabel("x (µm)", fontsize=9)
+    ax.set_ylabel("y (µm)", fontsize=9)
+    ax.tick_params(labelsize=7)
+
+    add_scale_bar(ax, bounds)
+
+
+def render_matched_graph(ax, cells: pd.DataFrame, edges: pd.DataFrame, bounds: tuple) -> None:
     coords_by_id = cells.set_index("cell_id")[["x_um", "y_um"]]
 
     if len(edges) > 0:
@@ -195,19 +235,13 @@ def render_matched_graph(ax, cells: pd.DataFrame, edges: pd.DataFrame, bounds: t
         color = TYPE_COLORS.get(cell_type, "black")
         ax.scatter(group["x_um"], group["y_um"], s=8, color=color, zorder=2)
 
-    # Set limits explicitly and disable autoscale so the field of view
-    # exactly matches the H&E crop's manifest bounds, not the data extent.
-    ax.set_xlim(x_min_um, x_max_um)
-    ax.set_ylim(y_max_um, y_min_um)
-    ax.set_autoscale_on(False)
-    ax.set_aspect("equal")
+    style_micron_axes(ax, bounds)
 
-    add_scale_bar(ax, bounds)
 
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.set_xlabel("")
-    ax.set_ylabel("")
+def render_he_crop(ax, he_image: Image.Image, bounds: tuple) -> None:
+    x_min_um, x_max_um, y_min_um, y_max_um = bounds
+    ax.imshow(he_image, extent=[x_min_um, x_max_um, y_max_um, y_min_um])
+    style_micron_axes(ax, bounds)
 
 
 def save_individual_graph(cells, edges, bounds, out_path: Path) -> None:
@@ -244,12 +278,7 @@ def main() -> None:
     resolved_items = []
     for item in ITEMS:
         row = load_manifest_row(args.patches_root, item["slide_id"], item["patch_id"])
-        bounds = (
-            float(row["x_min_um"]),
-            float(row["x_max_um"]),
-            float(row["y_min_um"]),
-            float(row["y_max_um"]),
-        )
+        bounds = get_patch_bounds(row)
 
         cells, edges = load_patch_graph(args.patches_root, item["slide_id"], item["patch_id"])
 
@@ -272,11 +301,12 @@ def main() -> None:
         )
 
     n_rows = len(resolved_items)
-    fig, axes = plt.subplots(n_rows, 2, figsize=(10, 5 * n_rows), facecolor="white")
+    fig, axes = plt.subplots(n_rows, 2, figsize=(12, 5.5 * n_rows), facecolor="white")
 
     # Reserve a generous top margin so the suptitle and column headers each
-    # get their own clear band of space and never overlap.
-    fig.subplots_adjust(top=0.93, bottom=0.06, hspace=0.35, wspace=0.15)
+    # get their own clear band of space, and generous hspace so each row's
+    # micron tick labels don't collide with the row above/below it.
+    fig.subplots_adjust(top=0.93, bottom=0.06, hspace=0.55, wspace=0.3)
 
     fig.suptitle(TITLE_TEXT, fontsize=20, y=0.985)
 
@@ -289,10 +319,11 @@ def main() -> None:
         graph_ax = axes[row_idx, 1]
 
         he_image = Image.open(entry["he_path"]).convert("RGB")
-        he_ax.imshow(he_image)
-        he_ax.set_xticks([])
-        he_ax.set_yticks([])
-        he_ax.set_ylabel(entry["label"], fontsize=12, rotation=0, ha="right", va="center", labelpad=40)
+        render_he_crop(he_ax, he_image, entry["bounds"])
+        he_ax.text(
+            -0.32, 0.5, entry["label"], transform=he_ax.transAxes,
+            fontsize=12, fontweight="bold", ha="right", va="center",
+        )
 
         render_matched_graph(graph_ax, entry["cells"], entry["edges"], entry["bounds"])
 
