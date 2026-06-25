@@ -63,12 +63,8 @@ def parse_args():
     return parser.parse_args()
 
 
-def find_patch_ids(patches_root):
-    patch_ids = []
-    for cells_path in sorted(patches_root.glob("patch_*_cells.csv")):
-        patch_id = cells_path.name[: -len("_cells.csv")]
-        patch_ids.append(patch_id)
-    return patch_ids
+def find_cell_files(patches_root):
+    return sorted(patches_root.glob("*/*_cells.csv"))
 
 
 def load_table(path, required_columns):
@@ -173,16 +169,19 @@ def main():
     if not args.patches_root.exists():
         raise FileNotFoundError(f"Patches root not found: {args.patches_root}")
 
-    patch_ids = find_patch_ids(args.patches_root)
-    if not patch_ids:
+    cell_files = find_cell_files(args.patches_root)
+    if not cell_files:
         raise FileNotFoundError(
-            f"No patch_*_cells.csv files found in {args.patches_root}"
+            f"No */*_cells.csv files found in {args.patches_root}"
         )
 
     rows = []
-    for patch_id in patch_ids:
-        cells_path = args.patches_root / f"{patch_id}_cells.csv"
-        edges_path = args.patches_root / f"{patch_id}_edges.csv"
+    for cells_path in cell_files:
+        edges_path = Path(str(cells_path).replace("_cells.csv", "_edges.csv"))
+
+        slide_id = cells_path.parent.name
+        patch_name = cells_path.name[: -len("_cells.csv")]
+        patch_id = f"{slide_id}_{patch_name}"
 
         cells = load_table(cells_path, CELL_COLUMNS)
         edges = load_table(edges_path, EDGE_COLUMNS)
