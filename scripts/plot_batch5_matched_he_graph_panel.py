@@ -1,10 +1,14 @@
-"""Plot JAGO cell graphs that share the exact field of view as their H&E crops.
+"""This is the canonical JAGO H&E ↔ graph figure script. It guarantees
+1:1 physical-coordinate comparison between H&E crops and cell graphs.
 
 Reads each patch's exact x/y bounds from patch_manifest.csv and uses those
 same bounds (equal aspect ratio, inverted y-axis, no autoscaling) for both
 the H&E crop and the cell graph, with both displayed on micron axes so the
 two panels are a true 1:1 physical-coordinate comparison rather than one
-being a plain pixel image and the other a coordinate plot.
+being a plain pixel image and the other a coordinate plot. Every patch is
+validated against the JAGO figure standards (matching bounds, equal aspect,
+micron axes, a 100 um scale bar, and human-readable cell type labels) before
+the figure is saved, raising a clear error if any standard is not met.
 """
 
 import argparse
@@ -34,6 +38,14 @@ DEFAULT_OUT_PNG = Path(
 DEFAULT_OUT_PDF = Path(
     "/scratch/groups/ccurtis2/neeldg/jago/outputs/batch5_jago/figures/he_graph_pair_panel_matched.pdf"
 )
+DEFAULT_METADATA_PATH = Path(
+    "/scratch/groups/ccurtis2/neeldg/jago/outputs/batch5_jago/figures/"
+    "he_graph_pair_panel_matched_metadata.csv"
+)
+
+# Tolerance (in microns) used when validating that rendered axis limits and
+# imshow extents exactly match the manifest-derived patch bounds.
+BOUNDS_ATOL_UM = 1e-6
 
 TYPE_MAP = {
     "type_0": "nolabe",
@@ -120,6 +132,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--graph-out-dir", required=False, type=Path, default=DEFAULT_GRAPH_OUT_DIR)
     parser.add_argument("--out-png", required=False, type=Path, default=DEFAULT_OUT_PNG)
     parser.add_argument("--out-pdf", required=False, type=Path, default=DEFAULT_OUT_PDF)
+    parser.add_argument("--metadata-out", required=False, type=Path, default=DEFAULT_METADATA_PATH)
     return parser.parse_args()
 
 
@@ -244,6 +257,84 @@ def render_he_crop(ax, he_image: Image.Image, bounds: tuple) -> None:
     style_micron_axes(ax, bounds)
 
 
+def validate_cell_types_readable(cells: pd.DataFrame, edges: pd.DataFrame, context: str) -> None:
+    """Enforce that every cell/edge type label is human-readable, not raw type_N."""
+    mapped_cell_types = set(cells["cell_type"].map(lambda t: TYPE_MAP.get(t, t)).unique())
+    mapped_edge_types = set(edges["source_cell_type"].map(lambda t: TYPE_MAP.get(t, t)).unique())
+    mapped_edge_types |= set(edges["target_cell_type"].map(lambda t: TYPE_MAP.get(t, t)).unique())
+
+    raw_leftover = sorted(
+        t for t in (mapped_cell_types | mapped_edge_types) if str(t).startswith("type_")
+    )
+    if raw_leftover:
+        raise ValueError(
+            f"{context}: found non-human-readable cell type label(s) {raw_leftover}. "
+            f"TYPE_MAP must cover every type id present in the data."
+        )
+
+
+def _has_equal_aspect(ax) -> bool:
+    aspect = ax.get_aspect()
+    if isinstance(aspect, str):
+        return aspect == "equal"
+    return float(aspect) == 1.0
+
+
+def _has_scale_bar(ax, scale_um: float = SCALE_BAR_UM, atol: float = 1e-6) -> bool:
+    has_line = any(
+        len(set(line.get_ydata())) == 1
+        and abs(abs(line.get_xdata()[-1] - line.get_xdata()[0]) - scale_um) < max(atol, scale_um * 1e-6)
+        for line in ax.lines
+    )
+    has_label = any(f"{scale_um:g} µm" in text.get_text() for text in ax.texts)
+    return has_line and has_label
+
+
+def validate_graph_axes(ax, bounds: tuple, context: str) -> None:
+    x_min_um, x_max_um, y_min_um, y_max_um = bounds
+
+    x_lim = ax.get_xlim()
+    y_lim = ax.get_ylim()
+    if not (abs(x_lim[0] - x_min_um) < BOUNDS_ATOL_UM and abs(x_lim[1] - x_max_um) < BOUNDS_ATOL_UM):
+        raise ValueError(f"{context}: graph x-limits {x_lim} do not match patch bounds ({x_min_um}, {x_max_um}).")
+    if not (abs(y_lim[0] - y_max_um) < BOUNDS_ATOL_UM and abs(y_lim[1] - y_min_um) < BOUNDS_ATOL_UM):
+        raise ValueError(
+            f"{context}: graph y-limits {y_lim} do not match inverted patch bounds ({y_max_um}, {y_min_um})."
+        )
+    if not _has_equal_aspect(ax):
+        raise ValueError(f"{context}: graph axes must use an equal aspect ratio.")
+    if "µm" not in ax.get_xlabel() or "µm" not in ax.get_ylabel():
+        raise ValueError(f"{context}: graph axes must display x/y in microns (µm).")
+    if not _has_scale_bar(ax):
+        raise ValueError(f"{context}: graph panel is missing a {SCALE_BAR_UM:g} µm scale bar.")
+
+
+def validate_he_axes(ax, bounds: tuple, context: str) -> None:
+    x_min_um, x_max_um, y_min_um, y_max_um = bounds
+
+    if not ax.images:
+        raise ValueError(f"{context}: H&E axes have no imshow image to validate extent against.")
+
+    extent = ax.images[-1].get_extent()
+    expected_extent = (x_min_um, x_max_um, y_max_um, y_min_um)
+    if any(abs(a - b) > BOUNDS_ATOL_UM for a, b in zip(extent, expected_extent)):
+        raise ValueError(f"{context}: H&E imshow extent {extent} does not match expected {expected_extent}.")
+
+    if not _has_equal_aspect(ax):
+        raise ValueError(f"{context}: H&E axes must use an equal aspect ratio.")
+    if "µm" not in ax.get_xlabel() or "µm" not in ax.get_ylabel():
+        raise ValueError(f"{context}: H&E axes must display x/y in microns (µm).")
+    if not _has_scale_bar(ax):
+        raise ValueError(f"{context}: H&E panel is missing a {SCALE_BAR_UM:g} µm scale bar.")
+
+
+def validate_patch_panel(he_ax, graph_ax, bounds: tuple, context: str) -> None:
+    """Enforce the JAGO figure standards: matching bounds, equal aspect,
+    micron axes, and a scale bar on both the H&E and graph panels."""
+    validate_he_axes(he_ax, bounds, context)
+    validate_graph_axes(graph_ax, bounds, context)
+
+
 def save_individual_graph(cells, edges, bounds, out_path: Path) -> None:
     x_min_um, x_max_um, y_min_um, y_max_um = bounds
     width_um = x_max_um - x_min_um
@@ -255,6 +346,7 @@ def save_individual_graph(cells, edges, bounds, out_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
     render_matched_graph(ax, cells, edges, bounds)
+    validate_graph_axes(ax, bounds, context=f"standalone graph {out_path.name}")
     ax.axis("off")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -276,11 +368,18 @@ def main() -> None:
     args = parse_args()
 
     resolved_items = []
+    metadata_rows = []
     for item in ITEMS:
+        context = f"{item['label']} ({item['slide_id']}/{item['patch_id']})"
+
         row = load_manifest_row(args.patches_root, item["slide_id"], item["patch_id"])
         bounds = get_patch_bounds(row)
+        x_min_um, x_max_um, y_min_um, y_max_um = bounds
 
+        cells_path = args.patches_root / item["slide_id"] / f"{item['patch_id']}_cells.csv"
+        edges_path = args.patches_root / item["slide_id"] / f"{item['patch_id']}_edges.csv"
         cells, edges = load_patch_graph(args.patches_root, item["slide_id"], item["patch_id"])
+        validate_cell_types_readable(cells, edges, context=context)
 
         he_path = args.he_dir / item["he"]
         if not he_path.exists():
@@ -297,6 +396,23 @@ def main() -> None:
                 "cells": cells,
                 "edges": edges,
                 "bounds": bounds,
+                "context": context,
+            }
+        )
+
+        metadata_rows.append(
+            {
+                "label": item["label"],
+                "slide_id": item["slide_id"],
+                "patch_id": item["patch_id"],
+                "x_min_um": x_min_um,
+                "x_max_um": x_max_um,
+                "y_min_um": y_min_um,
+                "y_max_um": y_max_um,
+                "window_um": x_max_um - x_min_um,
+                "he_file": str(he_path),
+                "cells_file": str(cells_path),
+                "edges_file": str(edges_path),
             }
         )
 
@@ -327,6 +443,8 @@ def main() -> None:
 
         render_matched_graph(graph_ax, entry["cells"], entry["edges"], entry["bounds"])
 
+        validate_patch_panel(he_ax, graph_ax, entry["bounds"], context=entry["context"])
+
     legend_handles = build_legend_handles()
     fig.legend(
         handles=legend_handles,
@@ -344,6 +462,18 @@ def main() -> None:
 
     print(f"Saved panel: {args.out_png}")
     print(f"Saved panel: {args.out_pdf}")
+
+    metadata = pd.DataFrame(
+        metadata_rows,
+        columns=[
+            "label", "slide_id", "patch_id",
+            "x_min_um", "x_max_um", "y_min_um", "y_max_um", "window_um",
+            "he_file", "cells_file", "edges_file",
+        ],
+    )
+    args.metadata_out.parent.mkdir(parents=True, exist_ok=True)
+    metadata.to_csv(args.metadata_out, index=False)
+    print(f"Saved metadata: {args.metadata_out}")
 
 
 if __name__ == "__main__":
