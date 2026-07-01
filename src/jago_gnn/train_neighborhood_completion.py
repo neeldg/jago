@@ -117,11 +117,18 @@ def run_epoch(
     num_classes: int,
     train: bool,
 ) -> dict:
+    """Run one epoch and return aggregate metrics + a per-sample records list.
+
+    Each record contains model predictions, ground truth, and the per-sample
+    baseline inputs (context_frac, ring_frac) so callers can compute all
+    per-sample comparisons from a single pass.
+    """
     model.train(mode=train)
     total_loss = 0.0
     n_samples = 0
     all_pred_comp, all_true_comp = [], []
     all_pred_count, all_true_count = [], []
+    all_context_frac, all_ring_frac = [], []
     all_metadata = []
 
     ctx = torch.enable_grad() if train else torch.no_grad()
@@ -149,27 +156,41 @@ def run_epoch(
             total_loss += loss.item() * B
             n_samples += B
 
-            pred_comp = F.softmax(comp_logits, dim=-1).detach().cpu().numpy()
-            all_pred_comp.append(pred_comp)
+            pred_comp_np = F.softmax(comp_logits, dim=-1).detach().cpu().numpy()
+            ctx_frac_np = batch["context_frac"].numpy()             # (B, C)
+            ring_fracs = batch["ring_frac"]                          # list[Tensor | None]
+            # Resolve None ring_frac entries to context_frac (consistent with baseline logic).
+            ring_np = np.stack([
+                rf.numpy() if rf is not None else ctx_frac_np[i]
+                for i, rf in enumerate(ring_fracs)
+            ], axis=0)
+
+            all_pred_comp.append(pred_comp_np)
             all_true_comp.append(target_comp.detach().cpu().numpy())
             all_pred_count.append(count_pred.detach().cpu().numpy())
             all_true_count.append(target_count.detach().cpu().numpy())
+            all_context_frac.append(ctx_frac_np)
+            all_ring_frac.append(ring_np)
             all_metadata.extend(batch["metadata"])
 
     if n_samples == 0:
         return _empty_result(num_classes)
 
-    pred_comp = np.concatenate(all_pred_comp, axis=0)   # (N, C)
+    pred_comp = np.concatenate(all_pred_comp, axis=0)       # (N, C)
     true_comp = np.concatenate(all_true_comp, axis=0)
     pred_count = np.concatenate(all_pred_count, axis=0)
     true_count = np.concatenate(all_true_count, axis=0)
+    context_frac = np.concatenate(all_context_frac, axis=0)
+    ring_frac = np.concatenate(all_ring_frac, axis=0)
 
-    abs_comp_err = np.abs(pred_comp - true_comp)        # (N, C)
+    abs_comp_err = np.abs(pred_comp - true_comp)
     records = [
         {
             **meta,
             "true_comp": true_comp[i],
             "pred_comp": pred_comp[i],
+            "context_frac": context_frac[i],
+            "ring_frac": ring_frac[i],
             "true_count": float(true_count[i]),
             "pred_count": float(pred_count[i]),
         }
@@ -179,7 +200,7 @@ def run_epoch(
     return {
         "loss": total_loss / n_samples,
         "comp_mae": float(abs_comp_err.mean()),
-        "per_class_comp_mae": abs_comp_err.mean(axis=0),               # (C,)
+        "per_class_comp_mae": abs_comp_err.mean(axis=0),
         "count_mae": float(np.abs(pred_count - true_count).mean()),
         "count_rmse": float(np.sqrt(np.mean((pred_count - true_count) ** 2))),
         "records": records,
@@ -187,41 +208,28 @@ def run_epoch(
 
 
 # ---------------------------------------------------------------------------
-# Baselines
+# Baselines (computed from records — no extra loader pass needed)
 # ---------------------------------------------------------------------------
 
-def evaluate_baselines(
-    loader: DataLoader,
+def compute_baseline_metrics_from_records(
+    records: list,
     train_global_comp: np.ndarray,
     train_mean_count: float,
     num_classes: int,
 ) -> dict:
-    """Return metrics for three composition baselines on one split."""
-    all_true_comp, all_true_count = [], []
-    all_context_frac, all_ring_pred = [], []
+    """Compute aggregate baseline metrics from the per-sample records list.
 
-    for batch in loader:
-        true_comp = batch["target_composition"].numpy()     # (B, C)
-        true_count = batch["target_count"].numpy()          # (B,)
-        context_frac = batch["context_frac"].numpy()        # (B, C)
-        ring_fracs = batch["ring_frac"]                     # list[Tensor | None]
-        B = batch["n_graphs"]
+    Uses the context_frac and ring_frac already stored in each record, so
+    this is always aligned with the samples that appear in the predictions CSV.
+    """
+    if not records:
+        return {}
 
-        all_true_comp.append(true_comp)
-        all_true_count.append(true_count)
-        all_context_frac.append(context_frac)
-
-        ring_preds = []
-        for i in range(B):
-            rf = ring_fracs[i]
-            ring_preds.append(rf.numpy() if rf is not None else context_frac[i])
-        all_ring_pred.append(np.stack(ring_preds, axis=0))
-
-    true_comp = np.concatenate(all_true_comp, axis=0)
-    true_count = np.concatenate(all_true_count, axis=0)
-    context_frac = np.concatenate(all_context_frac, axis=0)
-    ring_pred = np.concatenate(all_ring_pred, axis=0)
-    N = len(true_comp)
+    true_comp = np.stack([r["true_comp"] for r in records])
+    true_count = np.array([r["true_count"] for r in records])
+    context_frac = np.stack([r["context_frac"] for r in records])
+    ring_frac = np.stack([r["ring_frac"] for r in records])
+    N = len(records)
     global_pred = np.tile(train_global_comp, (N, 1))
     count_baseline = np.full(N, train_mean_count)
 
@@ -229,7 +237,7 @@ def evaluate_baselines(
     for name, comp_pred in [
         ("global_train_dist", global_pred),
         ("context_dist", context_frac),
-        ("ring_neighbor", ring_pred),
+        ("ring_neighbor", ring_frac),
     ]:
         abs_err = np.abs(comp_pred - true_comp)
         results[name] = {
@@ -245,7 +253,24 @@ def evaluate_baselines(
 # Output helpers
 # ---------------------------------------------------------------------------
 
-def save_predictions_csv(path: Path, records: list, idx_to_class: dict, num_classes: int) -> None:
+def save_predictions_csv(
+    path: Path,
+    records: list,
+    idx_to_class: dict,
+    num_classes: int,
+    train_global_comp: np.ndarray,
+    train_mean_count: float,
+) -> None:
+    """Write per-sample predictions including baseline preds and comparison columns.
+
+    Column layout (backward-compatible extension of the original format):
+      Identifiers and ground truth (unchanged)
+      true_comp_{n}, pred_comp_{n}          (unchanged)
+      global_comp_{n}, context_comp_{n}, ring_comp_{n}   (new)
+      abs_mae_model, abs_mae_global, abs_mae_context, abs_mae_ring  (new)
+      model_beats_context, model_beats_ring, model_beats_best_baseline  (new)
+      abs_count_error_model, abs_count_error_baseline_mean_train_count  (new)
+    """
     class_names = [idx_to_class.get(i, str(i)) for i in range(num_classes)]
     fields = (
         ["slide_id", "patch_id", "sample_idx",
@@ -253,11 +278,30 @@ def save_predictions_csv(path: Path, records: list, idx_to_class: dict, num_clas
          "true_count", "pred_count"]
         + [f"true_comp_{n}" for n in class_names]
         + [f"pred_comp_{n}" for n in class_names]
+        + [f"global_comp_{n}" for n in class_names]
+        + [f"context_comp_{n}" for n in class_names]
+        + [f"ring_comp_{n}" for n in class_names]
+        + ["abs_mae_model", "abs_mae_global", "abs_mae_context", "abs_mae_ring"]
+        + ["model_beats_context", "model_beats_ring", "model_beats_best_baseline"]
+        + ["abs_count_error_model", "abs_count_error_baseline_mean_train_count"]
     )
+
     with path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for rec in records:
+            tc = rec["true_comp"]
+            pc = rec["pred_comp"]
+            cf = rec["context_frac"]
+            rf = rec["ring_frac"]
+            gc = train_global_comp
+
+            mae_model = float(np.abs(pc - tc).mean())
+            mae_global = float(np.abs(gc - tc).mean())
+            mae_context = float(np.abs(cf - tc).mean())
+            mae_ring = float(np.abs(rf - tc).mean())
+            best_bl = min(mae_global, mae_context, mae_ring)
+
             row = {
                 "slide_id": rec["slide_id"],
                 "patch_id": rec["patch_id"],
@@ -268,11 +312,78 @@ def save_predictions_csv(path: Path, records: list, idx_to_class: dict, num_clas
                 "n_context": rec["n_context"],
                 "true_count": round(rec["true_count"], 4),
                 "pred_count": round(rec["pred_count"], 4),
+                "abs_mae_model": round(mae_model, 4),
+                "abs_mae_global": round(mae_global, 4),
+                "abs_mae_context": round(mae_context, 4),
+                "abs_mae_ring": round(mae_ring, 4),
+                "model_beats_context": mae_model < mae_context,
+                "model_beats_ring": mae_model < mae_ring,
+                "model_beats_best_baseline": mae_model < best_bl,
+                "abs_count_error_model": round(abs(rec["pred_count"] - rec["true_count"]), 4),
+                "abs_count_error_baseline_mean_train_count": round(abs(train_mean_count - rec["true_count"]), 4),
             }
             for i, n in enumerate(class_names):
-                row[f"true_comp_{n}"] = round(float(rec["true_comp"][i]), 4)
-                row[f"pred_comp_{n}"] = round(float(rec["pred_comp"][i]), 4)
+                row[f"true_comp_{n}"] = round(float(tc[i]), 4)
+                row[f"pred_comp_{n}"] = round(float(pc[i]), 4)
+                row[f"global_comp_{n}"] = round(float(gc[i]), 4)
+                row[f"context_comp_{n}"] = round(float(cf[i]), 4)
+                row[f"ring_comp_{n}"] = round(float(rf[i]), 4)
             w.writerow(row)
+
+
+def log_predictions_summary(
+    log_fn,
+    split_name: str,
+    records: list,
+    train_global_comp: np.ndarray,
+    train_mean_count: float,
+) -> None:
+    """Print win-rate summary and top/bottom samples vs ring_neighbor baseline."""
+    if not records:
+        return
+
+    tc = np.stack([r["true_comp"] for r in records])
+    pc = np.stack([r["pred_comp"] for r in records])
+    cf = np.stack([r["context_frac"] for r in records])
+    rf = np.stack([r["ring_frac"] for r in records])
+    gc = np.tile(train_global_comp, (len(records), 1))
+
+    mae_model = np.abs(pc - tc).mean(axis=1)
+    mae_global = np.abs(gc - tc).mean(axis=1)
+    mae_context = np.abs(cf - tc).mean(axis=1)
+    mae_ring = np.abs(rf - tc).mean(axis=1)
+    best_bl = np.minimum(np.minimum(mae_global, mae_context), mae_ring)
+
+    beats_context = mae_model < mae_context
+    beats_ring = mae_model < mae_ring
+    beats_best = mae_model < best_bl
+    N = len(records)
+
+    log_fn(f"\nModel vs baselines ({split_name}, N={N}):")
+    log_fn(f"  beats context_dist:       {beats_context.sum():3d}/{N} ({beats_context.mean()*100:.1f}%)")
+    log_fn(f"  beats ring_neighbor:      {beats_ring.sum():3d}/{N} ({beats_ring.mean()*100:.1f}%)")
+    log_fn(f"  beats best baseline:      {beats_best.sum():3d}/{N} ({beats_best.mean()*100:.1f}%)")
+
+    # margin > 0 means model beats ring
+    margin = mae_ring - mae_model
+    k = min(10, N)
+    hdr = f"  {'slide_id':<20s}  {'patch_id':<15s}  {'s':>3s}  {'mae_model':>9s}  {'mae_ring':>8s}  {'margin':>8s}"
+
+    top_beat = np.argsort(-margin)[:k]
+    log_fn(f"\n  Top {k} where model most beats ring_neighbor ({split_name}):")
+    log_fn(hdr)
+    for idx in top_beat:
+        r = records[idx]
+        log_fn(f"  {r['slide_id']:<20s}  {r['patch_id']:<15s}  {r['sample_idx']:>3d}"
+               f"  {mae_model[idx]:>9.4f}  {mae_ring[idx]:>8.4f}  {margin[idx]:>+8.4f}")
+
+    top_lose = np.argsort(margin)[:k]
+    log_fn(f"\n  Top {k} where model most loses to ring_neighbor ({split_name}):")
+    log_fn(hdr)
+    for idx in top_lose:
+        r = records[idx]
+        log_fn(f"  {r['slide_id']:<20s}  {r['patch_id']:<15s}  {r['sample_idx']:>3d}"
+               f"  {mae_model[idx]:>9.4f}  {mae_ring[idx]:>8.4f}  {margin[idx]:>+8.4f}")
 
 
 def save_baseline_metrics_csv(
@@ -330,7 +441,6 @@ def main() -> None:
     # -----------------------------------------------------------------------
     patches = load_all_patches(args.patch_root)
     vocab = build_cell_type_vocab(patches)
-    # vocab includes MASK_TOKEN; num_classes excludes it.
     num_classes = len(vocab) - 1
     idx_to_class = {idx: name for name, idx in vocab.items() if name not in ("<MASK>",)}
     log(f"Cell type vocab ({num_classes} classes): { {k: v for k, v in vocab.items() if k != '<MASK>'} }")
@@ -374,7 +484,7 @@ def main() -> None:
     # Training-set composition statistics (used by baselines)
     # -----------------------------------------------------------------------
     all_train_comp = np.stack([s["target_composition"].numpy() for s in train_ds.samples], axis=0)
-    train_global_comp = all_train_comp.mean(axis=0)     # (C,)
+    train_global_comp = all_train_comp.mean(axis=0)
     train_mean_count = float(np.mean([s["target_count"].item() for s in train_ds.samples]))
     log("Training-set mean hidden composition:")
     for cid in sorted(idx_to_class):
@@ -399,7 +509,6 @@ def main() -> None:
     log(f"Model parameters: {total_params:,}  (virtual_node={args.use_virtual_node})")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    # KLDivLoss expects log-probabilities as input; batchmean divides by B.
     loss_fn_comp = nn.KLDivLoss(reduction="batchmean")
     loss_fn_count = nn.HuberLoss()
 
@@ -409,7 +518,6 @@ def main() -> None:
     metrics_rows: list[dict] = []
     best_val_loss = float("inf")
     best_epoch = 0
-
     class_names = [idx_to_class.get(i, str(i)) for i in range(num_classes)]
 
     for epoch in range(1, args.epochs + 1):
@@ -476,7 +584,8 @@ def main() -> None:
     ckpt = torch.load(best_model_path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
 
-    final_val_records, final_test_records = [], []
+    final_val_records: list = []
+    final_test_records: list = []
 
     if val_loader is not None:
         final_val_m = run_epoch(
@@ -508,7 +617,6 @@ def main() -> None:
         for cid in sorted(idx_to_class):
             log(f"    {human_readable_class_name(idx_to_class[cid])}: {final_test_m['per_class_comp_mae'][cid]:.4f}")
 
-        # Append test row to metrics_rows for metrics.csv
         test_row: dict = {
             "epoch": "test",
             "train_loss": float("nan"),
@@ -526,13 +634,13 @@ def main() -> None:
         log("Test split is empty; skipping final test evaluation.")
 
     # -----------------------------------------------------------------------
-    # Baselines
+    # Baseline aggregate metrics (derived from records — no extra loader pass)
     # -----------------------------------------------------------------------
     all_baseline_results: dict = {}
-    for split_name, loader in [("val", val_loader), ("test", test_loader)]:
-        if loader is None:
+    for split_name, records in [("val", final_val_records), ("test", final_test_records)]:
+        if not records:
             continue
-        bl = evaluate_baselines(loader, train_global_comp, train_mean_count, num_classes)
+        bl = compute_baseline_metrics_from_records(records, train_global_comp, train_mean_count, num_classes)
         for bname, bmetrics in bl.items():
             all_baseline_results[(bname, split_name)] = bmetrics
 
@@ -544,14 +652,23 @@ def main() -> None:
             log(f"    {bname:<22s}  split={split:<5s}  comp_mae={bm['comp_mae']:.4f}  count_mae={bm['count_mae']:.4f}")
 
     # -----------------------------------------------------------------------
-    # Predictions CSVs
+    # Predictions CSVs + per-split win-rate summary
     # -----------------------------------------------------------------------
+    pred_csv_kwargs = dict(
+        idx_to_class=idx_to_class,
+        num_classes=num_classes,
+        train_global_comp=train_global_comp,
+        train_mean_count=train_mean_count,
+    )
     if final_val_records:
-        save_predictions_csv(predictions_val_path, final_val_records, idx_to_class, num_classes)
+        save_predictions_csv(predictions_val_path, final_val_records, **pred_csv_kwargs)
         log(f"Saved val predictions ({len(final_val_records)} rows): {predictions_val_path}")
+        log_predictions_summary(log, "val", final_val_records, train_global_comp, train_mean_count)
+
     if final_test_records:
-        save_predictions_csv(predictions_test_path, final_test_records, idx_to_class, num_classes)
+        save_predictions_csv(predictions_test_path, final_test_records, **pred_csv_kwargs)
         log(f"Saved test predictions ({len(final_test_records)} rows): {predictions_test_path}")
+        log_predictions_summary(log, "test", final_test_records, train_global_comp, train_mean_count)
 
     # -----------------------------------------------------------------------
     # metrics.csv and train_log.txt
